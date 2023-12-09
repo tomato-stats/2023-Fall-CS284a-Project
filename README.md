@@ -19,7 +19,7 @@ Unless you want to use the base Python environment, you need to select the virtu
 ```
 
 # This code selects the fourth environment listed. 
-use_condaenv(conda_list[[1]][4]), required = TRUE)
+use_condaenv(conda_list()[[1]][4], required = TRUE)
 
 ```
 

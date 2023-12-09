@@ -18,7 +18,7 @@ Unless you want to use the base Python environment, you need to select the virtu
 ```
 
 # This code selects the fourth environment listed. 
-use_condaenv(conda_list[[1]][4]), required = TRUE)
+use_condaenv(conda_list()[[1]][4], required = TRUE)
 
 ```
 
@@ -196,7 +196,7 @@ def padder0(dat, goal = 10):
         out = dat
     else: 
         deficit = goal - data_height
-        padding = torch.zeros(dat.size(0), deficit, dat.size(2))
+        padding = torch.zeros(dat.size(0), deficit, dat.size(2)).to(where)
         out = torch.cat((dat, padding), dim=1)
     return out
 
@@ -272,6 +272,74 @@ mse_loss = nn.MSELoss()
 
 ```
 
+# Model specification
+
+```{python model_modules}
+
+class tiered_cnn_1(nn.Module):
+    def __init__(self):
+        super(tiered_cnn_1, self).__init__()
+        self.layer1 = nn.Sequential(
+           nn.Conv2d(in_channels = 10, out_channels = 50, kernel_size = (5, 1000), stride = (1, 100), padding = (1, 300)),
+           nn.ReLU()
+        )
+        self.fc = nn.Linear(895, 800)
+        self.fc_out = nn.Linear(800, 18211)
+      
+    def forward(self, cat_input):
+        row_count = cat_input.size(1)
+        out = self.layer1(cat_input)
+        out = out.view(out.size(0), row_count, -1)
+        out = self.fc(out)
+        penultimate_out = out
+        out = self.fc_out(out)
+        return out, penultimate_out
+
+class tiered_lstm_1(nn.Module):
+    def __init__(self):
+        super(tiered_lstm_1, self).__init__()
+        self.layer1 = nn.Sequential(
+           nn.Conv2d(in_channels = 10, out_channels = 50, kernel_size = (5, 1000), stride = (1, 100), padding = (1, 300)),
+           nn.ReLU()
+        )
+        self.lstm = nn.LSTM(input_size= 3*18211, hidden_size = 64, num_layers = 4, batch_first = True)
+        self.relu = nn.ReLU()
+        self.fc = nn.Linear(895 + 64, 900)
+        self.fc_out = nn.Linear(900, 18211)
+      
+    def forward(self, cat_input):
+        row_count = cat_input.size(1)
+        out = self.layer1(cat_input)
+        out = out.view(out.size(0), row_count, -1)
+        out1, _ = self.lstm(cat_input.reshape(cat_input.size(0), cat_input.size(1), cat_input.size(2) * cat_input.size(3)))
+        out1 = self.relu(out1)
+        out = torch.cat((out, out1), -1)
+        out = self.fc(out)
+        penultimate_out = out
+        out = self.fc_out(out)
+        return out, penultimate_out
+      
+class tiered_cnn_1_augment(nn.Module):
+    def __init__(self):
+        super(tiered_cnn_1_augment, self).__init__()
+        self.layer1 = nn.Sequential(
+           nn.Conv2d(in_channels = 10, out_channels = 50, kernel_size = (5, 1000), stride = (1, 100), padding = (1, 300)),
+           nn.ReLU()
+        )
+        self.fc = nn.Linear(1790, 1700)
+        self.fc_out = nn.Linear(1700, 18211)
+      
+    def forward(self, cat_input):
+        row_count = cat_input.size(1)
+        out = self.layer1(cat_input)
+        out = out.view(out.size(0), row_count, -1)
+        out = self.fc(out)
+        penultimate_out = out
+        out = self.fc_out(out)
+        return out, penultimate_out
+
+```
+
 # Training and validation of first tier model
 
 ```{python tier1_data}
@@ -291,6 +359,8 @@ t8_only_data = DataLoader(t8_validator)
 This validation process was used to select the hyperparameters used. 
 
 ```{python tier1_cnn}
+
+num_epochs = 5
 
 # Tier 1 training
 
@@ -482,11 +552,11 @@ with torch.no_grad():
         ### FORWARD PASS
         # Predict T8 cells 
         input_batch3 = torch.cat((nk[:, :, 1:].unsqueeze(2), t4[:, :, 1:].unsqueeze(2), tr[:, :, 1:].unsqueeze(2)), 2)
-        imputed_batch3, imputed_pl3  = model1_3(padder(input_batch3.to("cpu")))
+        imputed_batch3, imputed_pl3  = model1_3(padder(input_batch3, where = "cpu").to(device))
         imputed_batch3 = imputed_batch3[:, 0:nk.size(1), :]
 
 # Convert to a DataFrame
-imputed_df = pd.DataFrame(imputed_batch3.detach().squeeze(0).numpy())
+imputed_df = pd.DataFrame(imputed_batch3.to("cpu").detach().squeeze(0).numpy())
 # Write to a CSV file
 imputed_df.to_csv("t8_imputations_cnn.csv", index=False)
 
@@ -565,7 +635,38 @@ model1_2.eval()
 
 ## Kaggle predictions 
 
+```{r kaggle_data}
+
+### Everything below this part can only be run after the imputation step in 
+### Python
+
+t8_imputed <- read_csv("t8_imputations_cnn.csv")
+colnames(t8_imputed) <- colnames(dat)[-(1:5)]
+t8_imputed[["cell_type"]] <-  "T cells CD8+" 
+t8_imputed[["control"]] <- 0
+t8_imputed[["sm_name"]] <- intermediate_set$sm_name
+t8_imputed[["sm_lincs_id"]] <- intermediate_set$sm_lincs_id 
+t8_imputed[["SMILES"]] <- intermediate_set$SMILES 
+appended_dat <- bind_rows(dat, t8_imputed)
+
+# Test set for Kaggle with imputed values for missing T8 data
+
+kaggle_set <- appended_dat |> filter(sm_name %in% map$sm_name)
+kaggle_set <- kaggle_set |> arrange(cell_type, sm_name)
+for(j in grep("NK|T", unique(dat$cell_type), value = T)){
+  write_csv(
+    kaggle_set |> filter(cell_type == j) |> select(-(1:4)), 
+    paste0("kaggle-", gsub("\\+", "", j), ".csv")
+  )
+}
+
+```
+
+
 ```{python kaggle_predictions}
+
+test_data = CSVLoader("kaggle")
+test_loader = DataLoader(test_data, shuffle = False)
 
 model1_1.to("cpu")
 model1_2.to("cpu")
@@ -624,7 +725,7 @@ class tiered_cnn_1_augment(nn.Module):
     def __init__(self):
         super(tiered_cnn_1_augment, self).__init__()
         self.layer1 = nn.Sequential(
-           nn.Conv2d(in_channels = len(rows_to_remove), out_channels = (len(rows_to_remove)/10) *50, kernel_size = (5, 1000), stride = (1, 100), padding = (1, 300)),
+           nn.Conv2d(in_channels = 15 - len(rows_to_remove), out_channels = int(((15 - len(rows_to_remove))/10)*50), kernel_size = (5, 1000), stride = (1, 100), padding = (1, 300)),
            nn.ReLU()
         )
         self.fc = nn.Linear(1790, 1700)
@@ -674,7 +775,7 @@ columns = ['row', 'Epochs', 'total_loss', "loss1", "loss2"]
 df_ = pd.DataFrame(columns=columns)
 
 # Leave one out cross-validation
-for j in [5]#range(num_rows):
+for j in range(num_rows):
     # Leave out ith row of data 
 
     nk_ = nk.clone() 
@@ -726,9 +827,5 @@ for j in [5]#range(num_rows):
         print(loss_b)
         print(loss_m)
         df_.loc[len(df_)] = [j, epoch+1, loss_b.item() + loss_m.item(), loss_b.item(), loss_m.item()]
-        if loss_b.item() < .1:
-            torch.save(model1_1.state_dict(), f'row{i}_epoch{epoch}_modelb.pth')
-        if loss_m.item() < .1:
-            torch.save(model1_2.state_dict(), f'row{i}_epoch{epoch}_modelmye.pth')
             
 ```

@@ -439,8 +439,6 @@ for learning_rate in [0.01, 0.005, 0.001]:
     model1_4.to(device)
     print(loss1 + loss2 + loss3 + loss4)
 
-# df.to_csv('loss.csv', index=False)
-
 ```
 
 ```{python final_tier1_fit}

@@ -614,7 +614,7 @@ write_csv(predictions[-(2:3)], "predictions.csv")
 
 ## Cross validation
 
-I did also test a similar model for the second tier using a leave-one-out cross-validation to determine the number of epochs. The performance was very similar, but not better than, the one down without leave-one-out cross-validation. The code is retained here as demonstrative that the work was done, but results from Kaggle are not the one reported in the project write-up. 
+I did also test a similar model for the second tier using a leave-one-out cross-validation to determine the number of epochs. The performance was very similar, but not better than, the one down without leave-one-out cross-validation. The code is retained here as demonstrative that the work was done.
 
 ```{python}
 

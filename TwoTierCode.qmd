@@ -1,0 +1,734 @@
+---
+title: "AI in Biology and Medicine Project"
+format: html
+jupyter: python3
+---
+
+# README
+
+This is a Quarto Markdown document that contains both R and Python code. Each chunk in the document can be run in an RStudio IDE as long as the necessary libraries are installed. You'll need to have the `reticulate` library in R in order to specify the Python virtual environment you need to run the code. You can see which virtual environments you have to use in R using the code: 
+```
+library(reticulate)
+
+conda_list()
+```
+
+Unless you want to use the base Python environment, you need to select the virtual environment before running any of the Python chunks below.
+
+```
+
+# This code selects the fourth environment listed. 
+use_condaenv(conda_list[[1]][4]), required = TRUE)
+
+```
+
+The code must be run in the order specified in this document and in the same session. Many models were created for this project. Only code for performing and validating the best-performing model(s) are provided below. The model inputs for different models tested were sufficiently different that most models had their own validation function. To provide all models and validation functions would be excessive. 
+
+You can technically knit/render this file, but it will take a while to run as it will run all cross-validation steps again. 
+
+# Data pre-processing
+ 
+This code generates the csv files that Python loads. 
+ 
+```{r parquet_to_csv}
+
+library(tidyverse) # If this package is too much, I think the R code will also run with just the readr and tidyr libraries. 
+library(arrow)
+
+dat <- read_parquet("de_train.parquet")
+dat <- dat |> mutate(control = as.numeric(control))
+map <- read_csv("id_map.csv")
+
+# Complete data only for 17 compounds
+# NK cells, T cells CD4+, T regulatory cells have data for 146 compounds
+# T cells CD8+ cells have data for 142 compounds
+
+# Tier 1 model
+# Training data for relationship between NK cells, T CD4+ cells, T CD8+, and T regulatory cells
+training_set <-
+  dat[, 1:6] |> 
+  filter(grepl("NK|T", cell_type)) |> 
+  pivot_wider(names_from = cell_type, values_from = A1BG) 
+training_set <- training_set[complete.cases(training_set), ]
+training_compounds <- training_set |> filter(control == 1)  |> pull(sm_name) |> unique()
+scrambled_compounds <- sample(unique(training_set |> filter(control == 0) |> pull(sm_name)))
+training_compounds <- c(training_compounds, scrambled_compounds[1:118])
+for(j in grep("NK|T", unique(dat$cell_type), value = T)){
+  write_csv(
+    dat |> filter(sm_name %in% training_compounds) |> filter(cell_type==j) |> select(-(1:4)), 
+    paste0("tier1-", gsub("\\+", "", j), ".csv")
+  )
+}
+
+# Validation data
+validation_compounds <- scrambled_compounds[119:length(scrambled_compounds)]
+for(j in grep("NK|T", unique(dat$cell_type), value = T)){
+  write_csv(
+    dat |> filter(sm_name %in% validation_compounds) |> filter(cell_type==j) |> select(-(1:4)), 
+    paste0("validation-", gsub("\\+", "", j), ".csv")
+  )
+}
+
+```
+ 
+# Python data loading and function definitions
+
+```{python imports}
+
+import glob
+import os
+import re
+import pandas as pd
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import Dataset
+from torch.utils.data import DataLoader
+import random
+
+```
+
+```{python customdataloader}
+
+# The files are quite large so custom loader below allows each iteration to load only
+# a partition of the data
+
+class CSVLoader(Dataset):
+    def __init__(self, pattern, lines_per_batch = 10, directory_path="./"):
+        """
+        Custom Dataset for loading CSV files containing a specific pattern in filenames.
+        :param directory_path: Path to the directory containing CSV files.
+        :param pattern: Pattern to search for in file names.
+        """
+        self.lines_per_batch = lines_per_batch
+        self.nk_paths = self.find_csv_files(directory_path, pattern = pattern + ".*NK")
+        self.t4_paths = self.find_csv_files(directory_path, pattern = pattern + ".*CD4")
+        self.t8_paths = self.find_csv_files(directory_path, pattern = pattern + ".*CD8")
+        self.tr_paths = self.find_csv_files(directory_path, pattern = pattern + ".*regulatory")
+        self.b_paths = self.find_csv_files(directory_path, pattern = pattern + ".*B")
+        self.mye_paths = self.find_csv_files(directory_path, pattern = pattern + ".*Mye")
+
+        self.nk_line_counts = [self.count_lines_in_csv(file) for file in self.nk_paths]
+        self.t4_line_counts = [self.count_lines_in_csv(file) for file in self.t4_paths]
+        self.t8_line_counts = [self.count_lines_in_csv(file) for file in self.t8_paths]
+        self.tr_line_counts = [self.count_lines_in_csv(file) for file in self.tr_paths]
+        self.b_line_counts = [self.count_lines_in_csv(file) for file in self.b_paths]
+        self.mye_line_counts = [self.count_lines_in_csv(file) for file in self.mye_paths]
+        
+        self.line_counts = [self.nk_line_counts, self.t4_line_counts, self.t8_line_counts, self.tr_line_counts, self.b_line_counts, self.mye_line_counts]
+
+    def find_csv_files(self, directory_path, pattern):
+        """
+        Find .csv files in the specified directory that contain the given pattern.
+        :param directory_path: Path to the directory to search in.
+        :param pattern: Pattern to search for in the file names.
+        :return: List of file paths matching the pattern.
+        """
+        # full_pattern = os.path.join(directory_path, f'*{pattern}*.csv')
+        # matching_files = glob.glob(full_pattern)
+        all_csv_files = glob.glob(os.path.join(directory_path, '*.csv'))
+        regex = re.compile(pattern)
+        matching_files = [file for file in all_csv_files if regex.search(os.path.basename(file))]
+        return matching_files
+      
+    def count_lines_in_csv(self, file_path):
+        line_count = -1
+        with open(file_path, 'r', encoding='utf-8') as file:
+            for _ in file:
+                line_count += 1
+        return line_count
+
+    def __len__(self):
+        """
+        Return the maximum number of lines for a dataset (summed across files)
+        """
+        max_line_count = max(sum(self.nk_line_counts),
+                             sum(self.t4_line_counts), 
+                             sum(self.t8_line_counts), 
+                             sum(self.tr_line_counts), 
+                             sum(self.b_line_counts), 
+                             sum(self.mye_line_counts))
+        return (max_line_count + self.lines_per_batch-1) // self.lines_per_batch
+      
+    def __getitem__(self, idx):
+        """
+        Load and return the dataset at the given index.
+        """
+        # Load data from a CSV file
+        paths = [self.nk_paths, self.t4_paths, self.t8_paths, self.tr_paths, self.b_paths, self.mye_paths]
+        output = [0 for _ in range(6)]
+
+        for i in range(6):
+
+            start = idx*self.lines_per_batch 
+            if not paths[i]:
+                output[i] = []
+            else: 
+                 for j in range(len(paths[i])):
+                     if(self.line_counts[i][j] > start):
+                         data = pd.read_csv(paths[i][j], skiprows = start, nrows = self.lines_per_batch)
+                         data = torch.tensor(data.values.astype(float)).float()
+                         output[i] = data
+                     else:
+                         output[i] = []
+        return output[0], output[1], output[2], output[3], output[4], output[5]
+
+```
+
+```{python padding_func}
+
+# Custom padding functions to resize data that are too short
+
+def padder(dat, goal = 10, where = "cuda"):
+    data_height = dat.size(1)
+    if data_height >= goal:
+        out = dat
+    else: 
+        deficit = goal - data_height
+        padding = torch.zeros(dat.size(0), deficit, dat.size(2), dat.size(3)).to(where)
+        out = torch.cat((dat, padding), dim=1)
+    return out
+
+def padder0(dat, goal = 10):
+    data_height = dat.size(1)
+    if data_height >= goal:
+        out = dat
+    else: 
+        deficit = goal - data_height
+        padding = torch.zeros(dat.size(0), deficit, dat.size(2))
+        out = torch.cat((dat, padding), dim=1)
+    return out
+
+```
+
+```{python validation_function}
+
+# Validation function for the first tier of the model
+
+def calculate_validation_loss_1(mod1, mod2, mod3, mod4, loader, loss_fn):
+    '''
+    Inputs: 
+        loader: data loader
+        mod: model to be evaluated
+        loss_fn: loss function
+     return:
+        weighted accuracy
+    '''
+    mod1.to("cpu")
+    mod1.eval()
+    mod2.to("cpu")
+    mod2.eval()
+    mod3.to("cpu")
+    mod3.eval()
+    mod4.to("cpu")
+    mod4.eval()
+    tot_loss = 0
+    l1 = 0
+    l2 = 0
+    l3 = 0
+    l4 = 0
+
+    with torch.no_grad():
+        for i, (nk, t4, t8, tr, _, _) in enumerate(loader):
+          nk, t4, t8, tr = nk.to("cpu"), t4.to("cpu"), t8.to("cpu"), tr.to("cpu")
+          ### FORWARD PASS
+          # NK cells 
+          input_batch1 = torch.cat((t4[:, :, 1:].unsqueeze(2), t8[:, :, 1:].unsqueeze(2), tr[:, :, 1:].unsqueeze(2)), 2)
+          output1, _ = mod1(padder(input_batch1, where="cpu"))
+          loss1 = mse_loss(output1[:, 0:nk.size(1), :], nk[:, :, 1:])
+          # Predict T4 cells 
+          input_batch2 = torch.cat((nk[:, :, 1:].unsqueeze(2), t8[:, :, 1:].unsqueeze(2), tr[:, :, 1:].unsqueeze(2)), 2)
+          output2, _ = mod2(padder(input_batch2, where="cpu"))
+          loss2 = mse_loss(output2[:, 0:t4.size(1), :], t4[:, :, 1:])
+          # Predict T8 cells 
+          input_batch3 = torch.cat((nk[:, :, 1:].unsqueeze(2), t4[:, :, 1:].unsqueeze(2), tr[:, :, 1:].unsqueeze(2)), 2)
+          output3, _ = mod3(padder(input_batch3, where="cpu"))
+          loss3 = mse_loss(output3[:, 0:t8.size(1), :], t8[:, :, 1:])
+          # Predict T regulatory cells 
+          input_batch4 = torch.cat((nk[:, :, 1:].unsqueeze(2), t4[:, :, 1:].unsqueeze(2), t8[:, :, 1:].unsqueeze(2)), 2)
+          output4, _ = mod4(padder(input_batch4, where="cpu"))
+          loss4 = mse_loss(output4[:, 0:tr.size(1), :], tr[:, :, 1:])
+          l1 += loss1.item()
+          l2 += loss2.item()
+          l3 += loss3.item()
+          l4 += loss4.item()
+          tot_loss += l1 + l2 + l3 + l4
+    
+    return tot_loss , l1 , l2 , l3, l4
+
+```
+
+```{python device_selection}
+
+if torch.cuda.is_available():
+    device = torch.device("cuda")
+    print("GPU is available")
+else:
+    device = torch.device("cpu")
+    print("GPU not available, using CPU")
+
+mse_loss = nn.MSELoss()
+
+```
+
+# Training and validation of first tier model
+
+```{python tier1_data}
+
+tier1_data = CSVLoader("tier1")
+tier1_dataloader = DataLoader(tier1_data)
+
+```
+
+```{python validation_data}
+
+t8_validator = CSVLoader("validation")
+t8_only_data = DataLoader(t8_validator)
+
+```
+
+This validation process was used to select the hyperparameters used. 
+
+```{python tier1_cnn}
+
+# Tier 1 training
+
+columns = ['LR', 'Epochs', 'total_loss', "loss1", "loss2", "loss3", "loss4"]
+df = pd.DataFrame(columns=columns)
+
+for learning_rate in [0.01, 0.005, 0.001]:
+
+  model1_1 = tiered_cnn_1()
+  model1_2 = tiered_cnn_1()
+  model1_3 = tiered_cnn_1()
+  model1_4 = tiered_cnn_1()
+  model1_1.to(device)
+  model1_2.to(device)
+  model1_3.to(device)
+  model1_4.to(device)
+  
+  optimizer1_1 = torch.optim.Adam(model1_1.parameters(), lr=learning_rate)
+  optimizer1_2 = torch.optim.Adam(model1_2.parameters(), lr=learning_rate)
+  optimizer1_3 = torch.optim.Adam(model1_3.parameters(), lr=learning_rate)
+  optimizer1_4 = torch.optim.Adam(model1_4.parameters(), lr=learning_rate)
+  
+  for epoch in range(num_epochs):
+    print(epoch)
+    
+    model1_1.train()
+    model1_2.train()
+    model1_3.train()
+    model1_4.train()
+    
+    # Iterate over the DataLoader
+    for i, (nk_batch, t4_batch, t8_batch, tr_batch, _, _) in enumerate(tier1_dataloader):
+      nk_batch, t4_batch, t8_batch, tr_batch = nk_batch.to(device), t4_batch.to(device), t8_batch.to(device), tr_batch.to(device)
+      ### FORWARD PASS
+      # Predict NK cells 
+      input_batch1 = torch.cat((t4_batch[:, :, 1:].unsqueeze(2), t8_batch[:, :, 1:].unsqueeze(2), tr_batch[:, :, 1:].unsqueeze(2)), 2)
+      output1, pl1 = model1_1(padder(input_batch1))
+      loss1 = mse_loss(output1[:, 0:nk_batch.size(1), :], nk_batch[:, :, 1:])
+      # Predict T4 cells 
+      input_batch2 = torch.cat((nk_batch[:, :, 1:].unsqueeze(2), t8_batch[:, :, 1:].unsqueeze(2), tr_batch[:, :, 1:].unsqueeze(2)), 2)
+      output2, pl2 = model1_2(padder(input_batch2))
+      loss2 = mse_loss(output2[:, 0:t4_batch.size(1), :], t4_batch[:, :, 1:])
+      # Predict T8 cells 
+      input_batch3 = torch.cat((nk_batch[:, :, 1:].unsqueeze(2), t4_batch[:, :, 1:].unsqueeze(2), tr_batch[:, :, 1:].unsqueeze(2)), 2)
+      output3, pl3 = model1_3(padder(input_batch3))
+      loss3 = mse_loss(output3[:, 0:t8_batch.size(1), :], t8_batch[:, :, 1:])
+      # Predict T regulatory cells 
+      input_batch4 = torch.cat((nk_batch[:, :, 1:].unsqueeze(2), t4_batch[:, :, 1:].unsqueeze(2), t8_batch[:, :, 1:].unsqueeze(2)), 2)
+      output4, pl4 = model1_4(padder(input_batch4))
+      loss4 = mse_loss(output4[:, 0:tr_batch.size(1), :], tr_batch[:, :, 1:])
+      
+      ### BACKWARD AND OPTIMIZE 
+      # NK cells
+      optimizer1_1.zero_grad()
+      loss1.backward()
+      optimizer1_1.step()
+      # T4 cells
+      optimizer1_2.zero_grad()
+      loss2.backward()
+      optimizer1_2.step()
+      # T8 cells
+      optimizer1_3.zero_grad()
+      loss3.backward()
+      optimizer1_3.step()
+      # T regulatory cells
+      optimizer1_4.zero_grad()
+      loss4.backward()
+      optimizer1_4.step()
+      
+    total_loss, l1, l2, l3, l4 = calculate_validation_loss_1(model1_1, model1_2, model1_3, model1_4, t8_only_data, mse_loss)
+    # Save metrics
+    df.loc[len(df)] = [learning_rate, epoch+1, total_loss, l1, l2, l3, l4]
+    model1_1.to(device)
+    model1_2.to(device)
+    model1_3.to(device)
+    model1_4.to(device)
+    print(loss1 + loss2 + loss3 + loss4)
+
+# df.to_csv('loss.csv', index=False)
+
+```
+
+```{python final_tier1_fit}
+
+columns = ['LR', 'Epochs', 'total_loss', "loss1", "loss2", "loss3", "loss4"]
+df_ = pd.DataFrame(columns=columns)
+
+learning_rate = 0.001
+num_epochs = 1
+
+model1_1 = tiered_cnn_1()
+model1_2 = tiered_cnn_1()
+model1_3 = tiered_cnn_1()
+model1_4 = tiered_cnn_1()
+model1_1.to(device)
+model1_2.to(device)
+model1_3.to(device)
+model1_4.to(device)
+  
+optimizer1_1 = torch.optim.Adam(model1_1.parameters(), lr=learning_rate)
+optimizer1_2 = torch.optim.Adam(model1_2.parameters(), lr=learning_rate)
+optimizer1_3 = torch.optim.Adam(model1_3.parameters(), lr=learning_rate)
+optimizer1_4 = torch.optim.Adam(model1_4.parameters(), lr=learning_rate)
+  
+for epoch in range(num_epochs):
+    model1_1.train()
+    model1_2.train()
+    model1_3.train()
+    model1_4.train()
+    
+    # Iterate over the DataLoader
+    for i, (nk_batch, t4_batch, t8_batch, tr_batch, _, _) in enumerate(tier1_dataloader):
+        nk_batch, t4_batch, t8_batch, tr_batch = nk_batch.to(device), t4_batch.to(device), t8_batch.to(device), tr_batch.to(device)
+        ### FORWARD PASS
+        # Predict NK cells 
+        input_batch1 = torch.cat((t4_batch[:, :, 1:].unsqueeze(2), t8_batch[:, :, 1:].unsqueeze(2), tr_batch[:, :, 1:].unsqueeze(2)), 2)
+        output1, _ = model1_1(padder(input_batch1, where="cuda"))
+        loss1 = mse_loss(output1[:, 0:nk_batch.size(1), :], nk_batch[:, :, 1:])
+        # Predict T4 cells 
+        input_batch2 = torch.cat((nk_batch[:, :, 1:].unsqueeze(2), t8_batch[:, :, 1:].unsqueeze(2), tr_batch[:, :, 1:].unsqueeze(2)), 2)
+        output2, _ = model1_2(padder(input_batch2, where="cuda"))
+        loss2 = mse_loss(output2[:, 0:t4_batch.size(1), :], t4_batch[:, :, 1:])
+        # Predict T8 cells 
+        input_batch3 = torch.cat((nk_batch[:, :, 1:].unsqueeze(2), t4_batch[:, :, 1:].unsqueeze(2), tr_batch[:, :, 1:].unsqueeze(2)), 2)
+        output3, _ = model1_3(padder(input_batch3, where="cuda"))
+        loss3 = mse_loss(output3[:, 0:t8_batch.size(1), :], t8_batch[:, :, 1:])
+        # Predict T regulatory cells 
+        input_batch4 = torch.cat((nk_batch[:, :, 1:].unsqueeze(2), t4_batch[:, :, 1:].unsqueeze(2), t8_batch[:, :, 1:].unsqueeze(2)), 2)
+        output4, _ = model1_4(padder(input_batch4, where="cuda"))
+        loss4 = mse_loss(output4[:, 0:tr_batch.size(1), :], tr_batch[:, :, 1:])
+      
+        ### BACKWARD AND OPTIMIZE 
+        # NK cells
+        optimizer1_1.zero_grad()
+        loss1.backward()
+        optimizer1_1.step()
+        # T4 cells
+        optimizer1_2.zero_grad()
+        loss2.backward()
+        optimizer1_2.step()
+        # T8 cells
+        optimizer1_3.zero_grad()
+        loss3.backward()
+        optimizer1_3.step()
+        # T regulatory cells
+        optimizer1_4.zero_grad()
+        loss4.backward()
+        optimizer1_4.step()
+      
+    total_loss, l1, l2, l3, l4 = calculate_validation_loss_1(model1_1, model1_2, model1_3, model1_4, t8_only_data, mse_loss)
+    # Save metrics
+    df_.loc[len(df_)] = [learning_rate, epoch+1, total_loss, l1, l2, l3, l4]
+    model1_1.to(device)
+    model1_2.to(device)
+    model1_3.to(device)
+    model1_4.to(device)
+    print(loss1 + loss2 + loss3 + loss4)
+
+```
+
+# Data imputation for missing observations in T CD8+ cells
+
+```{r missing_data}
+
+# Data the single missing T CD8+ data; need to impute these values. 
+
+intermediate_set <-
+  dat[, 1:6] |> 
+  filter(grepl("NK|T", cell_type)) |> 
+  pivot_wider(names_from = cell_type, values_from = A1BG) 
+intermediate_set <- intermediate_set[!complete.cases(intermediate_set),]
+
+for(j in grep("NK|4|reg", unique(dat$cell_type), value = T)){
+  write_csv(
+    dat |> filter(sm_name %in% intermediate_set$sm_name) |> filter(cell_type==j) |> select(-(1:4)), 
+    paste0("intermediate-", gsub("\\+", "", j), ".csv")
+  )
+}
+
+```
+
+```{python impute_data}
+
+imputation_data = CSVLoader("intermediate")
+imputation_loader = DataLoader(imputation_data, shuffle = False)
+
+with torch.no_grad():
+    for i, (nk, t4, _, tr, b, mye) in enumerate(imputation_loader):
+        ### FORWARD PASS
+        # Predict T8 cells 
+        input_batch3 = torch.cat((nk[:, :, 1:].unsqueeze(2), t4[:, :, 1:].unsqueeze(2), tr[:, :, 1:].unsqueeze(2)), 2)
+        imputed_batch3, imputed_pl3  = model1_3(padder(input_batch3.to("cpu")))
+        imputed_batch3 = imputed_batch3[:, 0:nk.size(1), :]
+
+# Convert to a DataFrame
+imputed_df = pd.DataFrame(imputed_batch3.detach().squeeze(0).numpy())
+# Write to a CSV file
+imputed_df.to_csv("t8_imputations_cnn.csv", index=False)
+
+```
+
+# Tier 2 model fitting
+
+```{r tier2_data}
+
+# Tier 2 model data
+# Data where all cells have data, including B, and Myeloid data
+
+complete_cmpds <- dat |> filter(grepl("B|Mye|8", cell_type )) |> 
+  select(1:6) |> pivot_wider(names_from = cell_type, values_from = A1BG) 
+complete_cmpds <- complete_cmpds[complete.cases(complete_cmpds), ] |> pull(sm_name)
+for(j in unique(dat$cell_type)){
+  write_csv(
+    dat |> filter(sm_name %in% complete_cmpds) |> filter(cell_type==j) |> select(-(1:4)), 
+    paste0("tier2-", gsub("\\+", "", j), ".csv")
+  )
+}
+
+```
+
+```{python tier2}
+
+tier2_data = CSVLoader("tier2", lines_per_batch = 10)
+tier2_dataloader = DataLoader(tier2_data)
+
+
+columns = ['LR', 'Epochs', 'total_loss', "loss1", "loss2", "loss3", "loss4"]
+df_ = pd.DataFrame(columns=columns)
+
+learning_rate = 0.001
+num_epochs = 1
+
+model1_1 = tiered_cnn_1_augment()
+model1_2 = tiered_cnn_1_augment()
+
+model1_1.to(device)
+model1_2.to(device)
+
+optimizer1_1 = torch.optim.Adam(model1_1.parameters(), lr=learning_rate)
+optimizer1_2 = torch.optim.Adam(model1_2.parameters(), lr=learning_rate)
+
+for epoch in range(num_epochs):
+    model1_1.train()
+    model1_2.train()
+    
+    # Iterate over the DataLoader
+    for i, (nk_batch, t4_batch, t8_batch, tr_batch, b_batch, mye_batch) in enumerate(tier2_dataloader):
+        nk_batch, t4_batch, t8_batch, tr_batch, b_batch, mye_batch = nk_batch.to(device), t4_batch.to(device), t8_batch.to(device), tr_batch.to(device), b_batch.to(device), mye_batch.to(device)
+        ### FORWARD PASS
+        # Predict B cells 
+        input_batch = torch.cat((nk_batch[:, :, 1:].unsqueeze(2), t4_batch[:, :, 1:].unsqueeze(2), t8_batch[:, :, 1:].unsqueeze(2), tr_batch[:, :, 1:].unsqueeze(2)), 2)
+        output1, _ = model1_1(padder(input_batch))
+        output2, _ = model1_2(padder(input_batch))
+        
+        loss1 = mse_loss(output1[:, 0:b_batch.size(1), :], b_batch[:, :, 1:])
+        loss2 = mse_loss(output2[:, 0:mye_batch.size(1), :], mye_batch[:, :, 1:])
+      
+        ### BACKWARD AND OPTIMIZE 
+        # B cells
+        optimizer1_1.zero_grad()
+        loss1.backward()
+        optimizer1_1.step()
+        # Myeloid cells
+        optimizer1_2.zero_grad()
+        loss2.backward()
+        optimizer1_2.step()
+
+model1_1.eval()
+model1_2.eval()
+
+```
+
+## Kaggle predictions 
+
+```{python kaggle_predictions}
+
+model1_1.to("cpu")
+model1_2.to("cpu")
+
+predictions_df1 = pd.DataFrame()
+predictions_df2 = pd.DataFrame()
+
+# Iterate over the DataLoader
+for i, (nk_batch, t4_batch, t8_batch, tr_batch, b_batch, mye_batch) in enumerate(test_loader):
+    # Predict B and Myeloid cells
+    row_count = nk_batch.size(1)
+    input_batch = torch.cat((nk_batch[:, :, 1:].unsqueeze(2), t4_batch[:, :, 1:].unsqueeze(2), t8_batch[:, :, 1:].unsqueeze(2), tr_batch[:, :, 1:].unsqueeze(2)), 2)
+    output1, _ = model1_1(padder(input_batch, where="cpu"))
+    output2, _ = model1_2(padder(input_batch, where="cpu"))
+
+    # Convert to a DataFrame
+    outpt_t2_df1 = pd.DataFrame(output1[:, 0:row_count, :].to("cpu").detach().squeeze(0).numpy())
+    outpt_t2_df2 = pd.DataFrame(output2[:, 0:row_count, :].to("cpu").detach().squeeze(0).numpy())
+    predictions_df1 = pd.concat([predictions_df1, outpt_t2_df1], ignore_index=True)
+    predictions_df2 = pd.concat([predictions_df2, outpt_t2_df2], ignore_index=True)
+
+# predictions_df = pd.concat([predictions_df1, predictions_df2], ignore_index = True)
+predictions_df1.to_csv("predictions_b1.csv", index = False)
+predictions_df2.to_csv("predictions_m1.csv", index = False)
+
+```
+
+```{r kaggle_csv}
+
+b <- read_csv("predictions_b1.csv")
+mye <- read_csv("predictions_m1.csv")
+
+colnames(b) <- colnames(dat)[-(1:5)]
+colnames(mye) <- colnames(dat)[-(1:5)]
+b[["sm_name"]] <- unique(kaggle_set$sm_name)
+b[["cell_type"]] <- "B cells"
+mye[["sm_name"]] <- unique(kaggle_set$sm_name)
+mye[["cell_type"]] <- "Myeloid cells"
+predictions <- bind_rows(b, mye)
+predictions <- left_join(map, predictions, by = c("sm_name", "cell_type"))
+write_csv(predictions[-(2:3)], "predictions.csv")
+
+
+```
+
+
+## Cross validation
+
+I did also test a similar model for the second tier using a leave-one-out cross-validation to determine the number of epochs. The performance was very similar, but not better than, the one down without leave-one-out cross-validation. The code is retained here as demonstrative that the work was done, but results from Kaggle are not the one reported in the project write-up. 
+
+```{python}
+
+rows_to_remove = [8, 10]
+
+class tiered_cnn_1_augment(nn.Module):
+    def __init__(self):
+        super(tiered_cnn_1_augment, self).__init__()
+        self.layer1 = nn.Sequential(
+           nn.Conv2d(in_channels = len(rows_to_remove), out_channels = (len(rows_to_remove)/10) *50, kernel_size = (5, 1000), stride = (1, 100), padding = (1, 300)),
+           nn.ReLU()
+        )
+        self.fc = nn.Linear(1790, 1700)
+        self.fc_out = nn.Linear(1700, 18211)
+      
+    def forward(self, cat_input):
+        row_count = cat_input.size(1)
+        out = self.layer1(cat_input)
+        out = out.view(out.size(0), row_count, -1)
+        out = self.fc(out)
+        penultimate_out = out
+        out = self.fc_out(out)
+        return out, penultimate_out
+
+tier2_data = CSVLoader("tier2", lines_per_batch = 50)
+tier2_dataloader = DataLoader(tier2_data)
+
+nk, t4, t8, tr, b, mye = next(iter(tier2_dataloader))
+nk = nk[:, :, 1:].unsqueeze(2)
+t4 = t4[:, :, 1:].unsqueeze(2)
+t8 = t8[:, :, 1:].unsqueeze(2)
+tr = tr[:, :, 1:].unsqueeze(2)
+b = b[:, :, 1:].unsqueeze(2)
+mye = mye[:, :, 1:].unsqueeze(2)
+
+
+nk = torch.cat([nk[:, i, :].unsqueeze(1) for i in range(nk.shape[1]) if i not in rows_to_remove], dim=1)
+t4 = torch.cat([t4[:, i, :].unsqueeze(1) for i in range(t4.shape[1]) if i not in rows_to_remove], dim=1)
+t8 = torch.cat([t8[:, i, :].unsqueeze(1) for i in range(t8.shape[1]) if i not in rows_to_remove], dim=1)
+tr = torch.cat([tr[:, i, :].unsqueeze(1) for i in range(tr.shape[1]) if i not in rows_to_remove], dim=1)
+b = torch.cat([b[:, i, :].unsqueeze(1) for i in range(b.shape[1]) if i not in rows_to_remove], dim=1)
+mye = torch.cat([mye[:, i, :].unsqueeze(1) for i in range(mye.shape[1]) if i not in rows_to_remove], dim=1)
+num_rows = nk.shape[1]
+
+nk = nk.to(device)
+t4 = t4.to(device)
+t8 = t8.to(device)
+tr = tr.to(device)
+b =  b.to(device)
+mye = mye.to(device)
+
+random.seed(0)
+np.random.seed(0)
+torch.manual_seed(0)
+
+columns = ['row', 'Epochs', 'total_loss', "loss1", "loss2"]
+df_ = pd.DataFrame(columns=columns)
+
+# Leave one out cross-validation
+for j in [5]#range(num_rows):
+    # Leave out ith row of data 
+
+    nk_ = nk.clone() 
+    t4_ = t4.clone() 
+    t8_ = t8.clone() 
+    tr_ = tr.clone() 
+    b_ = b.clone() 
+    mye_ = mye.clone() 
+
+    nk_[:, j, :] = 0
+    t4_[:, j, :] = 0
+    t8_[:, j, :] = 0
+    tr_[:, j, :] = 0
+    b_[:, j, :] = 0
+    mye_[:, j, :] = 0
+    input_batch = torch.cat((nk_, t4_, t8_, tr_), 2)
+    input_batch = input_batch.to(device)
+
+    model1_1 = tiered_cnn_1_augment()
+    model1_2 = tiered_cnn_1_augment()
+    model1_1.to(device)
+    model1_2.to(device)
+    optimizer1_1 = torch.optim.Adam(model1_1.parameters(), lr=0.001)
+    optimizer1_2 = torch.optim.Adam(model1_2.parameters(), lr=0.001)
+
+    for epoch in range(2):
+        print(epoch)
+        model1_1.train()
+        model1_2.train()
+
+        output1, _ = model1_1(input_batch)
+        output2, _ = model1_2(input_batch)
+        
+        loss1 = mse_loss(output1, b_.squeeze(2))
+        loss2 = mse_loss(output2, mye_.squeeze(2))  
+        ### BACKWARD AND OPTIMIZE 
+        # B cells
+        optimizer1_1.zero_grad()
+        loss1.backward()
+        optimizer1_1.step()
+        # Myeloid cells
+        optimizer1_2.zero_grad()
+        loss2.backward()
+        optimizer1_2.step()
+        
+        # Validation loss
+        loss_b = mse_loss(output1[:, j, :].unsqueeze(1), b[:, j, :])
+        loss_m = mse_loss(output2[:, j, :].unsqueeze(1), b[:, j, :])
+        print(loss_b)
+        print(loss_m)
+        df_.loc[len(df_)] = [j, epoch+1, loss_b.item() + loss_m.item(), loss_b.item(), loss_m.item()]
+        if loss_b.item() < .1:
+            torch.save(model1_1.state_dict(), f'row{i}_epoch{epoch}_modelb.pth')
+        if loss_m.item() < .1:
+            torch.save(model1_2.state_dict(), f'row{i}_epoch{epoch}_modelmye.pth')
+            
+```

@@ -7,7 +7,7 @@ The code to the neural network regression model is provided as a Jupyter noteboo
 
 # Information on the two-tier models:
 
-This is a Quarto Markdown document that contains both R and Python code. Each chunk in the document can be run in an RStudio IDE as long as the necessary libraries are installed. You'll need to have the `reticulate` library in R in order to specify the Python virtual environment you need to run the code. You can see which virtual environments you have to use in R using the code: 
+The TwoTierCode is a Quarto Markdown document that contains both R and Python code. Each chunk in the document can be run in an RStudio IDE as long as the necessary libraries are installed. You'll need to have the `reticulate` library in R in order to specify the Python virtual environment you need to run the code. You can see which virtual environments you have to use in R using the code: 
 ```
 library(reticulate)
 
